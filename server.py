@@ -34,4 +34,3 @@ while True:
         else:
             # Send error message if recipient does not exist
             sock.sendto("אין כזה משתמש".encode(), addr)
-
