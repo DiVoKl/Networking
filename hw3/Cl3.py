@@ -1,139 +1,145 @@
 import socket
-import threading
 import struct
+import threading
 
-# Protocol Symbols (Message Types)
+# Frames use a six-byte header, followed by at most 65535 payload bytes.
+MAX_PAYLOAD = 65535
+
 IDENTIFY = 2
 SEND_MSG = 3
-DISCONNECT = 4
-AUTH_RESP = 6
-ERROR_MSG = 7
-SYS_MSG = 8  # <--- NEW
+CLIENT_CONNECTION = 1
+CLIENT_MESSAGE = 0
+MESSAGE_SIGNS = {
+    IDENTIFY: "#$",
+    SEND_MSG: "$!",
+}
 
 
-def read_bytes(conn, size):
-    data = b''
+def log_message(direction, msg_type, subtype):
+    """Print the marker for a sent or received protocol message."""
+    sign = MESSAGE_SIGNS.get(msg_type, "?!")
+    print(f"{sign} [{direction} TYPE {msg_type}:{subtype}]", flush=True)
+
+
+def recv_exact(conn, size):
+    """Read exactly size bytes, or return None if the server disconnects."""
+    data = bytearray()
     while len(data) < size:
-        packet = conn.recv(size - len(data))
-        if not packet:
+        chunk = conn.recv(size - len(data))
+        if not chunk:
             return None
-        data += packet
-    return data
+        data.extend(chunk)
+    return bytes(data)
 
 
-def listen_for_msgs(client_socket):
-    while True:
-        try:
-            header = read_bytes(client_socket, 6)
-            if not header:
-                break
-            msg_type, subtype, length, sublen = struct.unpack('>BBHH', header)
-            data = read_bytes(client_socket, length) if length > 0 else b''
-
-            if msg_type == SEND_MSG:
-                routing_prefix = data[:sublen]
-                message_content = data[sublen:].decode()
-
-                parts = routing_prefix.split(b'\0')
-                if len(parts) >= 2:
-                    sender = parts[1].decode()
-                    print(f"\n>>> [FROM {sender}]: {message_content} <<<")
-                else:
-                    print(f"\n>>> [INCOMING]: {message_content} <<<")
-
-            elif msg_type == ERROR_MSG:
-                print(f"\n!!!> [ERROR]: {data.decode()} <!!!")
-
-            # --- NEW: Catch and display System Updates ---
-            elif msg_type == SYS_MSG:
-                print(f"\n***> [SYSTEM]: {data.decode()} <***")
-
-        except Exception:
-            print("\n!!!> Connection closed by server. Press enter to exit. <!!!")
-            break
+def recv_message(conn):
+    """Read and decode one six-byte-header protocol frame."""
+    header = recv_exact(conn, 6)
+    if header is None:
+        return None
+    msg_type, subtype, length, sublen = struct.unpack(">BBHH", header)
+    data = recv_exact(conn, length) if length else b""
+    if data is None:
+        return None
+    return msg_type, subtype, sublen, data
 
 
-def send_msg(conn, msg_type, subtype, sublen, data):
-    header = struct.pack('>BBHH', msg_type, subtype, len(data), sublen)
-    conn.sendall(header + data)
+def send_message(conn, msg_type, subtype, sublen, data):
+    """Encode and send one complete protocol frame."""
+    if len(data) > MAX_PAYLOAD:
+        raise ValueError(f"Payload exceeds {MAX_PAYLOAD} bytes")
+    conn.sendall(struct.pack(">BBHH", msg_type, subtype, len(data), sublen) + data)
+    log_message("SEND", msg_type, subtype)
+
+
+def listen_for_messages(conn):
+    """Print incoming chat messages while the input loop is running."""
+    try:
+        while True:
+            message = recv_message(conn)
+            if message is None:
+                print("\n[CLIENT] Server closed the connection.")
+                return
+            msg_type, subtype, sublen, data = message
+            log_message("RECV", msg_type, subtype)
+            if msg_type != SEND_MSG:
+                continue
+            if subtype != CLIENT_MESSAGE or sublen > len(data):
+                print("\n[CLIENT] Ignoring malformed message.")
+                continue
+
+            routing = data[:sublen].split(b"\0", 1)
+            sender = routing[1].decode("utf-8", "replace") if len(routing) == 2 else "unknown"
+            content = data[sublen:].decode("utf-8", "replace")
+            print(f"\n[FROM {sender}]: {content}")
+    except (OSError, ValueError, struct.error) as error:
+        print(f"\n[CLIENT] Receive error: {error}")
 
 
 def main():
-    client = None
+    """Connect to a server, identify the client, and run the chat input loop."""
+    host = input("Enter server address (e.g. 127.0.0.1): ").strip()
+    try:
+        port = int(input("Enter server port: "))
+    except ValueError:
+        print("Enter a valid server port.")
+        return
+    username = input("Enter your username: ").strip()
+    if not host or not 1 <= port <= 65535 or not username:
+        print("Server address, valid port, and username are required.")
+        return
 
-    # --- CONNECTION & AUTHENTICATION LOOP ---
-    while True:
-        print("\n===> Enter Server Details <===")
-        host = input("Enter server IP (e.g., 127.0.0.1): ")
-        try:
-            port = int(input("Enter server Port (e.g., 5000): "))
-        except ValueError:
-            print("!!!> Invalid port number. Try again. <!!!")
-            continue
+    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        conn.connect((host, port))
+        send_message(conn, IDENTIFY, CLIENT_CONNECTION, 0, username.encode("utf-8"))
+    except OSError as error:
+        conn.close()
+        print(f"Could not connect to {host}:{port}: {error}")
+        return
 
-        username = input("Enter your username: ")
+    print(f"[CONNECTED] {host}:{port} as {username}.")
+    threading.Thread(target=listen_for_messages, args=(conn,), daemon=True).start()
+    print("[READY] Enter <recipient>:<message>, or 'exit' to disconnect.")
 
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-        try:
-            client.connect((host, port))
-            send_msg(client, IDENTIFY, 1, 0, username.encode())
-
-            header = read_bytes(client, 6)
-            if not header:
-                print("!!!> Connection closed by server before authentication. <!!!")
-                client.close()
-                continue
-
-            msg_type, subtype, length, sublen = struct.unpack('>BBHH', header)
-            data = read_bytes(client, length) if length > 0 else b''
-
-            if msg_type == AUTH_RESP:
-                if subtype == 0:
-                    print(f"!!!> Registration Failed: {data.decode()} <!!!")
-                    print("!!!> Please choose a different username and try again. <!!!")
-                    client.close()
-                    continue
-                elif subtype == 1:
-                    print(f"***> Connected to {host}:{port}. {data.decode()} <***")
-                    break
-
-        except Exception as e:
-            print(f"!!!> Connection error: {e} <!!!")
-            print("!!!> Retrying connection setup... <!!!")
-            if client:
-                client.close()
-            continue
-
-    # --- CHAT LOOP ---
-    threading.Thread(target=listen_for_msgs, args=(client,), daemon=True).start()
-
-    print("===> To send a message type: <receiver_name>:<message> <===")
-    print("===> To disconnect, type: exit <===")
-
+    send_lock = threading.Lock()
     try:
         while True:
-            user_input = input()
-
-            if user_input.strip().lower() == 'exit':
-                print("<<<> Sending disconnect signal to server... <<<>")
-                send_msg(client, DISCONNECT, 0, 0, b'')
+            try:
+                text = input()
+            except EOFError:
                 break
+            if text.strip().lower() == "exit":
+                break
+            if ":" not in text:
+                print("Use <recipient>:<message>.")
+                continue
 
-            if ":" in user_input:
-                receiver, msg = user_input.split(":", 1)
-                receiver_bytes = receiver.encode()
-                msg_bytes = msg.encode()
-
-                data = receiver_bytes + msg_bytes
-                sublen = len(receiver_bytes)
-
-                send_msg(client, SEND_MSG, 0, sublen, data)
-            else:
-                print("!!!> Invalid format. Use <receiver_name>:<message> <!!!")
+            recipient, content = text.split(":", 1)
+            recipient = recipient.strip()
+            recipient_bytes = recipient.encode("utf-8")
+            content_bytes = content.encode("utf-8")
+            if (
+                not recipient_bytes
+                or b"\0" in recipient_bytes
+                or len(recipient_bytes) > 255
+                or len(recipient_bytes) + len(content_bytes) + 34 > MAX_PAYLOAD
+            ):
+                print("Recipient is required and the message must fit in one protocol frame.")
+                continue
+            with send_lock:
+                send_message(
+                    conn,
+                    SEND_MSG,
+                    CLIENT_MESSAGE,
+                    len(recipient_bytes),
+                    recipient_bytes + content_bytes,
+                )
+    except (OSError, ValueError) as error:
+        print(f"[CLIENT] Send error: {error}")
     finally:
-        client.close()
+        conn.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
