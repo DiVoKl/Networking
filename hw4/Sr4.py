@@ -56,8 +56,6 @@ own_port = None
 
 def log_message(direction, msg_type, subtype):
     """Print a short marker for visible protocol messages."""
-    if msg_type in (REQ_INFO, REP_INFO):
-        return
     name = MESSAGE_NAMES.get(msg_type, "UNKNOWN")
     sign = MESSAGE_SIGNS.get(msg_type, "?!")
     print(f"{sign} [{direction} {name}:{subtype}]", flush=True)
@@ -102,17 +100,20 @@ def server_addresses_payload():
     """Return known server addresses as null-separated host:port entries."""
     with state_lock:
         addresses = dict(known_servers)
-        addresses.update({port: HOST for port in servers_dict})
+        addresses.update(
+            {port: known_servers.get(port, HOST) for port in servers_dict}
+        )
     return b"\0".join(
         f"{host}:{port}".encode() for port, host in sorted(addresses.items())
     )
 
 
 def broadcast_server_list(exclude_conn=None):
-    """Share the current topology with every peer except the source link."""
+    """Share the current topology with peers and connected chat clients."""
     data = server_addresses_payload()
     with state_lock:
         peers = list(servers_dict.values())
+        clients = list(clients_dict.values())
     for peer in peers:
         if peer is exclude_conn:
             continue
@@ -121,6 +122,12 @@ def broadcast_server_list(exclude_conn=None):
         except OSError as error:
             print(f"[NETWORK] Could not update a peer's server list: {error}")
             close_connection(peer)
+    for client in clients:
+        try:
+            send_message(client, REP_INFO, 0, 0, data)
+        except OSError as error:
+            print(f"[CLIENT] Could not update a client's server list: {error}")
+            close_connection(client)
 
 
 def handle_info_request(conn, subtype):
@@ -294,7 +301,7 @@ def identify_connection(conn, subtype, data, address):
         except (UnicodeDecodeError, ValueError):
             print(f"[NETWORK] Rejecting server with invalid identity from {address}.")
             return False
-        if remote_port not in SERVER_PORTS or remote_port == own_port:
+        if not 1 <= remote_port <= 65535 or remote_port == own_port:
             print(f"[NETWORK] Rejecting invalid server port {remote_port}.")
             return False
 
@@ -304,7 +311,7 @@ def identify_connection(conn, subtype, data, address):
                 print(f"[NETWORK] Duplicate connection from server {remote_port}.")
                 return False
             servers_dict[remote_port] = conn
-            known_servers[remote_port] = HOST
+            known_servers[remote_port] = address[0]
 
         print(f"[NETWORK] Connected to server {remote_port} at {address}.")
         send_message(conn, REQ_INFO, 0, 0, b"")
@@ -332,6 +339,7 @@ def identify_connection(conn, subtype, data, address):
 
 def remove_connection(conn):
     """Remove a disconnected socket from all active connection maps."""
+    server_disconnected = False
     with state_lock:
         username = next(
             (name for name, client_conn in clients_dict.items() if client_conn is conn),
@@ -343,8 +351,13 @@ def remove_connection(conn):
         for port, peer in list(servers_dict.items()):
             if peer is conn:
                 del servers_dict[port]
+                if port != own_port:
+                    known_servers.pop(port, None)
+                server_disconnected = True
                 print(f"[NETWORK] Server {port} disconnected.")
         send_locks.pop(conn, None)
+    if server_disconnected:
+        broadcast_server_list()
 
 
 def close_connection(conn):
@@ -436,7 +449,7 @@ def connect_to_known_servers(data):
             port = int(port_text)
         except (UnicodeDecodeError, ValueError):
             continue
-        if host and port > own_port and port in SERVER_PORTS:
+        if host and port > own_port:
             addresses.append((port, host))
 
     for port, host in sorted(set(addresses)):

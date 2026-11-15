@@ -2,6 +2,7 @@ import socket
 import struct
 import threading
 import time
+import uuid
 
 # Frames use a six-byte header, followed by at most 65535 payload bytes.
 MAX_PAYLOAD = 65535
@@ -19,16 +20,34 @@ ECHO_REPLY = 1
 ECHO_PROBE = b"hello"
 ECHO_RESPONSE = b"ifmmp"
 MESSAGE_SIGNS = {
+    REQ_INFO: "!@",
+    REP_INFO: "@#",
     IDENTIFY: "#$",
     SEND_MSG: "$!",
     ECHO: "%^",
 }
+MESSAGE_NAMES = {
+    REQ_INFO: "INFO REQUEST",
+    REP_INFO: "INFO REPLY",
+    IDENTIFY: "IDENTIFY",
+    SEND_MSG: "MESSAGE",
+    ECHO: "ECHO",
+}
+
+connection_lock = threading.RLock()
+topology_lock = threading.Lock()
+topology_changed = threading.Event()
+current_connection = None
+current_server = None
+current_rtt = None
+known_servers = {}
 
 
 def log_message(direction, msg_type, subtype):
     """Print the marker for a sent or received protocol message."""
     sign = MESSAGE_SIGNS.get(msg_type, "?!")
-    print(f"{sign} [{direction} TYPE {msg_type}:{subtype}]", flush=True)
+    name = MESSAGE_NAMES.get(msg_type, "UNKNOWN")
+    print(f"{sign} [{direction} {name}:{subtype}]", flush=True)
 
 
 def recv_exact(conn, size):
@@ -63,16 +82,45 @@ def send_message(conn, msg_type, subtype, sublen, data, log=True):
         log_message("SEND", msg_type, subtype)
 
 
+def update_server_list(data):
+    """Record a server-list update and request a fresh RTT comparison."""
+    updated = {}
+    for entry in data.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            host, port_text = entry.decode().rsplit(":", 1)
+            port = int(port_text)
+        except (UnicodeDecodeError, ValueError):
+            print(f"[DISCOVERY] Ignoring invalid address: {entry!r}")
+            continue
+        if host.strip() and 1 <= port <= 65535:
+            updated[port] = host.strip()
+
+    with topology_lock:
+        if updated != known_servers:
+            known_servers.clear()
+            known_servers.update(updated)
+            topology_changed.set()
+
+
 def listen_for_messages(conn):
     """Print incoming chat messages while the input loop is running."""
     try:
         while True:
             message = recv_message(conn)
             if message is None:
-                print("\n[CLIENT] Server closed the connection.")
+                with connection_lock:
+                    is_current = conn is current_connection
+                if is_current:
+                    print("\n[CLIENT] Server closed the connection.")
+                    topology_changed.set()
                 return
             msg_type, subtype, sublen, data = message
             log_message("RECV", msg_type, subtype)
+            if msg_type == REP_INFO and subtype == 0:
+                update_server_list(data)
+                continue
             if msg_type != SEND_MSG:
                 continue
             if subtype != CLIENT_MESSAGE or sublen > len(data):
@@ -84,12 +132,16 @@ def listen_for_messages(conn):
             content = data[sublen:].decode("utf-8", "replace")
             print(f"\n[FROM {sender}]: {content}")
     except (OSError, ValueError, struct.error) as error:
-        print(f"\n[CLIENT] Receive error: {error}")
+        with connection_lock:
+            is_current = conn is current_connection
+        if is_current:
+            print(f"\n[CLIENT] Receive error: {error}")
+            topology_changed.set()
     finally:
         conn.close()
 
 
-def probe_server(host, port, username, existing_conn=None):
+def probe_server(host, port, username, existing_conn=None, identity=None):
     """Connect to a server if needed and return its measured RTT and socket."""
     conn = existing_conn
     try:
@@ -98,16 +150,24 @@ def probe_server(host, port, username, existing_conn=None):
         conn.settimeout(PROBE_TIMEOUT)
         if existing_conn is None:
             conn.connect((host, port))
-            send_message(conn, IDENTIFY, CLIENT_CONNECTION, 0, username.encode("utf-8"))
+            probe_label = username[:32].replace("\0", "_")
+            probe_identity = identity or f"__rtt_{probe_label}_{uuid.uuid4().hex}"
+            send_message(conn, IDENTIFY, CLIENT_CONNECTION, 0, probe_identity.encode("utf-8"))
 
         log_message("SEND", ECHO, ECHO_REQUEST)
         started = time.perf_counter()
         send_message(conn, ECHO, ECHO_REQUEST, 0, ECHO_PROBE, log=False)
-        response = recv_message(conn)
+        while True:
+            response = recv_message(conn)
+            if response is None:
+                raise ConnectionError("Server closed before echo response")
+            msg_type, subtype, sublen, data = response
+            log_message("RECV", msg_type, subtype)
+            if msg_type == REP_INFO and subtype == 0:
+                update_server_list(data)
+                continue
+            break
         elapsed = time.perf_counter() - started
-        if response is None:
-            raise ConnectionError("Server closed before echo response")
-        msg_type, subtype, sublen, data = response
         if (
             msg_type != ECHO
             or subtype != ECHO_REPLY
@@ -131,6 +191,7 @@ def discover_and_select(host, port, username, initial_conn):
     if response is None:
         raise ConnectionError("Server closed before sending its server list")
     msg_type, subtype, _, data = response
+    log_message("RECV", msg_type, subtype)
     if msg_type != REP_INFO or subtype != 0:
         raise ValueError("Server did not return the requested server list")
 
@@ -173,7 +234,7 @@ def discover_and_select(host, port, username, initial_conn):
             conn.close()
     best_conn.settimeout(None)
     print(f"[RTT] Selected {addresses[best_port]}:{best_port} ({best_rtt * 1000:.2f} ms).")
-    return best_conn
+    return best_conn, best_rtt, best_port, addresses
 
 
 def append_probe_result(results, results_lock, result, port):
@@ -185,8 +246,101 @@ def append_probe_result(results, results_lock, result, port):
         results.append((rtt, conn, port))
 
 
+def monitor_server_rtt(username):
+    """Recheck discovered servers after topology updates and migrate if faster."""
+    global current_connection, current_server, current_rtt
+    while True:
+        topology_changed.wait()
+        topology_changed.clear()
+        with topology_lock:
+            addresses = dict(known_servers)
+        with connection_lock:
+            active_server = current_server
+            active_rtt = current_rtt
+        if active_server is None:
+            continue
+
+        measured = []
+        threads = []
+        results_lock = threading.Lock()
+        probe_identity = f"__rtt_{uuid.uuid4().hex}"
+        for server_port, server_host in sorted(addresses.items()):
+            thread = threading.Thread(
+                target=lambda h=server_host, p=server_port: append_probe_result(
+                    measured,
+                    results_lock,
+                    probe_server(h, p, username, identity=probe_identity),
+                    p,
+                ),
+                daemon=True,
+            )
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        if not measured:
+            print("[RTT] No discovered servers responded to a probe.")
+            continue
+
+        active_samples = [result for result in measured if result[2] == active_server[1]]
+        alternatives = [result for result in measured if result[2] != active_server[1]]
+        for _, conn, _ in measured:
+            conn.close()
+        if active_samples:
+            active_rtt = min(result[0] for result in active_samples)
+            with connection_lock:
+                if current_server == active_server:
+                    current_rtt = active_rtt
+        else:
+            active_rtt = None
+            with connection_lock:
+                if current_server == active_server:
+                    current_rtt = None
+        if not alternatives:
+            continue
+        best_rtt, _, best_port = min(alternatives, key=lambda result: (result[0], result[2]))
+        if active_rtt is not None and best_rtt >= active_rtt:
+            print(f"[RTT] Current server {active_server[0]}:{active_server[1]} remains fastest.")
+            continue
+
+        new_host = addresses[best_port]
+        replacement = probe_server(
+            new_host,
+            best_port,
+            username,
+            identity=username,
+        )
+        if replacement is None:
+            continue
+        replacement_rtt, replacement_conn = replacement
+        with connection_lock:
+            if current_server != active_server or current_connection is None:
+                replacement_conn.close()
+                continue
+            if current_rtt is not None and replacement_rtt >= current_rtt:
+                replacement_conn.close()
+                continue
+            old_conn = current_connection
+            current_connection = replacement_conn
+            current_server = (new_host, best_port)
+            current_rtt = replacement_rtt
+        replacement_conn.settimeout(None)
+        threading.Thread(
+            target=listen_for_messages,
+            args=(replacement_conn,),
+            daemon=True,
+        ).start()
+        old_conn.close()
+        print(
+            f"[RTT] Switched to faster server {new_host}:{best_port} "
+            f"({replacement_rtt * 1000:.2f} ms)."
+        )
+
+
 def main():
     """Connect to a server, identify the client, and run the chat input loop."""
+    global current_connection, current_server, current_rtt
     host = input("Enter server address (e.g. 127.0.0.1): ").strip()
     try:
         port = int(input("Enter server port: "))
@@ -202,7 +356,17 @@ def main():
     try:
         conn.connect((host, port))
         send_message(conn, IDENTIFY, CLIENT_CONNECTION, 0, username.encode("utf-8"))
-        conn = discover_and_select(host, port, username, conn)
+        conn, current_rtt, selected_port, addresses = discover_and_select(
+            host, port, username, conn
+        )
+        current_connection = conn
+        current_server = (addresses[selected_port], selected_port)
+        update_server_list(
+            b"\0".join(
+                f"{server_host}:{server_port}".encode()
+                for server_port, server_host in addresses.items()
+            )
+        )
     except OSError as error:
         conn.close()
         print(f"Could not connect to {host}:{port}: {error}")
@@ -212,8 +376,9 @@ def main():
         print(f"Server discovery failed: {error}")
         return
 
-    print(f"[CONNECTED] {host}:{port} as {username}.")
+    print(f"[CONNECTED] {current_server[0]}:{current_server[1]} as {username}.")
     threading.Thread(target=listen_for_messages, args=(conn,), daemon=True).start()
+    threading.Thread(target=monitor_server_rtt, args=(username,), daemon=True).start()
     print("[READY] Enter <recipient>:<message>, or 'exit' to disconnect.")
 
     send_lock = threading.Lock()
@@ -241,9 +406,9 @@ def main():
             ):
                 print("Recipient is required and the message must fit in one protocol frame.")
                 continue
-            with send_lock:
+            with send_lock, connection_lock:
                 send_message(
-                    conn,
+                    current_connection,
                     SEND_MSG,
                     CLIENT_MESSAGE,
                     len(recipient_bytes),
@@ -252,7 +417,10 @@ def main():
     except (OSError, ValueError) as error:
         print(f"[CLIENT] Send error: {error}")
     finally:
-        conn.close()
+        with connection_lock:
+            if current_connection is not None:
+                current_connection.close()
+                current_connection = None
 
 
 if __name__ == "__main__":
