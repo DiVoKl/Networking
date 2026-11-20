@@ -7,7 +7,6 @@ from collections import deque
 # Server ports are also the stable IDs used to order connections.
 HOST = "127.0.0.1"
 SERVER_PORTS = (5000, 5001, 5002, 5003, 5004)
-BOOTSTRAP_ADDRESSES = [(HOST, port) for port in SERVER_PORTS]
 MAX_CLIENTS = 5
 MAX_USERNAME_BYTES = 255
 MAX_PAYLOAD = 65535
@@ -21,7 +20,7 @@ SEND_MSG = 3
 SERVER_CONNECTION = 0
 CLIENT_CONNECTION = 1
 CLIENT_MESSAGE = 0
-SERVER_FLOOD = 1
+SERVER_MESSAGE = 1
 MESSAGE_NAMES = {
     REQ_INFO: "INFO REQUEST",
     REP_INFO: "INFO REPLY",
@@ -39,7 +38,8 @@ MESSAGE_SIGNS = {
 servers_dict = {}
 clients_dict = {}
 known_servers = {}
-# Message IDs stop flooded messages from looping or being delivered twice.
+known_clients = {}
+# Message IDs prevent duplicate server-side deliveries.
 seen_messages = set()
 seen_message_order = deque()
 # Locks keep shared maps and concurrent socket writes consistent.
@@ -102,6 +102,19 @@ def server_addresses_payload():
     )
 
 
+def client_names_payload():
+    """Return this server's local usernames as a null-separated payload."""
+    with state_lock:
+        names = sorted(clients_dict)
+    return b"\0".join(name.encode() for name in names)
+
+
+def announce_server_state(conn):
+    """Send the current server and local client vocabularies to a new peer."""
+    send_message(conn, REP_INFO, 0, 0, server_addresses_payload())
+    send_message(conn, REP_INFO, 1, 0, client_names_payload())
+
+
 def broadcast_server_list(exclude_conn=None):
     """Share the current topology with every peer except the source link."""
     data = server_addresses_payload()
@@ -116,13 +129,26 @@ def broadcast_server_list(exclude_conn=None):
             print(f"[NETWORK] Could not update a peer's server list: {error}")
 
 
+def broadcast_client_list(exclude_conn=None):
+    """Share this server's local client vocabulary with its peers."""
+    data = client_names_payload()
+    with state_lock:
+        peers = list(servers_dict.values())
+    for peer in peers:
+        if peer is exclude_conn:
+            continue
+        try:
+            send_message(peer, REP_INFO, 1, 0, data)
+        except OSError as error:
+            print(f"[NETWORK] Could not update a peer's client list: {error}")
+
+
 def handle_info_request(conn, subtype):
     """Reply with either the server list or this server's local usernames."""
     if subtype == 0:
         data = server_addresses_payload()
     elif subtype == 1:
-        with state_lock:
-            data = b"\0".join(name.encode() for name in sorted(clients_dict))
+        data = client_names_payload()
     else:
         return
     send_message(conn, REP_INFO, subtype, 0, data)
@@ -179,21 +205,30 @@ def deliver_to_local_client(recipient, sender, content):
     return True
 
 
-def broadcast_flood(data, sublen, exclude_conn=None):
-    """Forward a message flood to connected peers, excluding its sender."""
+def send_to_servers(data, sublen, target_port=None):
+    """Send once to one known server, or to every connected peer."""
     with state_lock:
-        peers = list(servers_dict.values())
-    for peer in peers:
-        if peer is exclude_conn:
-            continue
+        if target_port is None:
+            peers = list(servers_dict.items())
+        else:
+            peer = servers_dict.get(target_port)
+            peers = [(target_port, peer)] if peer is not None else []
+    if target_port is not None and not peers:
+        print(f"[ROUTING] Known recipient server {target_port} is not connected.")
+        return
+    if not peers:
+        print("[ROUTING] No connected servers are available.")
+        return
+
+    for port, peer in peers:
         try:
-            send_message(peer, SEND_MSG, SERVER_FLOOD, sublen, data)
+            send_message(peer, SEND_MSG, SERVER_MESSAGE, sublen, data)
         except OSError as error:
-            print(f"[NETWORK] Could not forward message to a server: {error}")
+            print(f"[NETWORK] Could not send message to server {port}: {error}")
 
 
-def process_server_flood(conn, sublen, data):
-    """Deduplicate a received flood, deliver locally, or relay it onward."""
+def process_server_message(conn, sublen, data):
+    """Deduplicate a peer message and deliver it only if the recipient is local."""
     fields = data.split(b"\0", 3)
     if len(fields) != 4:
         print("[ROUTING] Ignoring malformed server message.")
@@ -219,13 +254,12 @@ def process_server_flood(conn, sublen, data):
             print(f"[ROUTING] Delivered {sender} -> {recipient} on this server.")
         else:
             print(f"[ROUTING] Server {peer_port} checked for {recipient}: not local.")
-            broadcast_flood(data, sublen, exclude_conn=conn)
     except OSError as error:
         print(f"[ROUTING] Delivery failed for {recipient}: {error}")
 
 
 def process_client_message(conn, sublen, data):
-    """Route a client's message locally or start a deduplicated network flood."""
+    """Deliver locally, target a known server, or check all connected peers."""
     if sublen == 0 or sublen > len(data):
         print("[ROUTING] Ignoring malformed client message.")
         return
@@ -253,11 +287,25 @@ def process_client_message(conn, sublen, data):
         print(f"[ROUTING] Delivered {sender} -> {recipient} on this server.")
         return
 
+    with state_lock:
+        target_port = next(
+            (
+                port
+                for port, usernames in known_clients.items()
+                if port != own_port and recipient in usernames and port in servers_dict
+            ),
+            None,
+        )
+
     message_id = uuid.uuid4().hex.encode()
     remember_message(message_id)
     relay_data = routing_prefix + b"\0" + message_id + b"\0" + content
-    print(f"[ROUTING] {recipient} is not local; flooding connected servers.")
-    broadcast_flood(relay_data, len(routing_prefix))
+    if target_port is not None:
+        print(f"[ROUTING] {recipient} is on server {target_port}; sending directly.")
+        send_to_servers(relay_data, len(routing_prefix), target_port)
+    else:
+        print(f"[ROUTING] {recipient} is not known; checking connected servers.")
+        send_to_servers(relay_data, len(routing_prefix))
 
 
 def identify_connection(conn, subtype, data, address):
@@ -281,9 +329,9 @@ def identify_connection(conn, subtype, data, address):
             known_servers[remote_port] = HOST
 
         print(f"[NETWORK] Connected to server {remote_port} at {address}.")
-        send_message(conn, REQ_INFO, 0, 0, b"")
-        send_message(conn, REQ_INFO, 1, 0, b"")
+        announce_server_state(conn)
         broadcast_server_list(exclude_conn=conn)
+        broadcast_client_list(exclude_conn=conn)
         return True
 
     if subtype == CLIENT_CONNECTION:
@@ -297,7 +345,9 @@ def identify_connection(conn, subtype, data, address):
                 print(f"[CLIENT] Rejecting unavailable username {username!r}.")
                 return False
             clients_dict[username] = conn
+            known_clients.setdefault(own_port, set()).add(username)
         print(f"[CLIENT] {username} connected from {address}.")
+        broadcast_client_list()
         return True
 
     print(f"[NETWORK] Rejecting unknown connection subtype {subtype}.")
@@ -306,6 +356,7 @@ def identify_connection(conn, subtype, data, address):
 
 def remove_connection(conn):
     """Remove a disconnected socket from all active connection maps."""
+    client_disconnected = False
     with state_lock:
         username = next(
             (name for name, client_conn in clients_dict.items() if client_conn is conn),
@@ -313,12 +364,17 @@ def remove_connection(conn):
         )
         if username is not None:
             del clients_dict[username]
+            known_clients.setdefault(own_port, set()).discard(username)
+            client_disconnected = True
             print(f"[CLIENT] {username} disconnected.")
         for port, peer in list(servers_dict.items()):
             if peer is conn:
                 del servers_dict[port]
+                known_clients.pop(port, None)
                 print(f"[NETWORK] Server {port} disconnected.")
         send_locks.pop(conn, None)
+    if client_disconnected:
+        broadcast_client_list()
 
 
 def connection_handler(conn, address, already_identified=False):
@@ -357,12 +413,19 @@ def connection_handler(conn, address, already_identified=False):
                         for user in data.split(b"\0")
                         if user
                     ]
+                    with state_lock:
+                        remote_port = next(
+                            (port for port, peer in servers_dict.items() if peer is conn),
+                            None,
+                        )
+                        if remote_port is not None:
+                            known_clients[remote_port] = set(users)
                     print(f"[NETWORK] Server {address} reports local clients: {users or 'none'}.")
             elif msg_type == SEND_MSG:
                 if subtype == CLIENT_MESSAGE:
                     process_client_message(conn, sublen, data)
-                elif subtype == SERVER_FLOOD:
-                    process_server_flood(conn, sublen, data)
+                elif subtype == SERVER_MESSAGE:
+                    process_server_message(conn, sublen, data)
             else:
                 print(f"[NETWORK] Ignoring unsupported message type {msg_type}.")
     except (OSError, ValueError, struct.error) as error:
@@ -402,74 +465,47 @@ def connect_to_known_servers(data):
             addresses.append((port, host))
 
     for port, host in sorted(set(addresses)):
+        connect_to_server(host, port)
+
+
+def connect_to_server(host, port):
+    """Connect to one peer, then exchange vocabularies and join its topology."""
+    if port not in SERVER_PORTS or port == own_port:
+        print(f"[NETWORK] Cannot connect to invalid server port {port}.")
+        return False
+    with state_lock:
+        if port in servers_dict:
+            return True
+
+    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        conn.settimeout(2)
+        conn.connect((host, port))
+        conn.settimeout(None)
         with state_lock:
             if port in servers_dict:
-                continue
-        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            conn.settimeout(2)
-            conn.connect((host, port))
-            conn.settimeout(None)
-            with state_lock:
-                if port in servers_dict:
-                    conn.close()
-                    continue
-                servers_dict[port] = conn
-                known_servers[port] = host
-            threading.Thread(
-                target=connection_handler,
-                args=(conn, (host, port), True),
-                daemon=True,
-            ).start()
-            send_message(conn, IDENTIFY, SERVER_CONNECTION, 0, str(own_port).encode("ascii"))
-            send_message(conn, REQ_INFO, 0, 0, b"")
-            send_message(conn, REQ_INFO, 1, 0, b"")
-            broadcast_server_list(exclude_conn=conn)
-            print(f"[NETWORK] Connected to known server {host}:{port}.")
-        except OSError as error:
-            conn.close()
-            with state_lock:
-                if servers_dict.get(port) is conn:
-                    del servers_dict[port]
-            if not isinstance(error, ConnectionRefusedError):
-                print(f"[NETWORK] Could not connect to {host}:{port}: {error}")
-
-
-def search_bootstrap_servers():
-    """Check each bootstrap address once and connect to every available peer."""
-    found_server = False
-    for host, port in sorted(BOOTSTRAP_ADDRESSES, key=lambda address: (address[1], address[0])):
-        if port == own_port:
-            continue
-        print(f"[CHECKING] Looking for server at {host}:{port}.", flush=True)
-        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            conn.settimeout(2)
-            conn.connect((host, port))
-            conn.settimeout(None)
-            with state_lock:
-                if port in servers_dict:
-                    conn.close()
-                    found_server = True
-                    continue
-                servers_dict[port] = conn
-                known_servers[port] = host
-            threading.Thread(
-                target=connection_handler,
-                args=(conn, (host, port), True),
-                daemon=True,
-            ).start()
-            send_message(conn, IDENTIFY, SERVER_CONNECTION, 0, str(own_port).encode("ascii"))
-            send_message(conn, REQ_INFO, 0, 0, b"")
-            send_message(conn, REQ_INFO, 1, 0, b"")
-            broadcast_server_list(exclude_conn=conn)
-            print(f"[SUCCESS] Connected to bootstrap server {host}:{port}.", flush=True)
-            found_server = True
-        except OSError:
-            conn.close()
-    if not found_server:
-        print("[NETWORK] No existing servers found; waiting for incoming connections.", flush=True)
-    return found_server
+                conn.close()
+                return True
+            servers_dict[port] = conn
+            known_servers[port] = host
+        send_message(conn, IDENTIFY, SERVER_CONNECTION, 0, str(own_port).encode("ascii"))
+        announce_server_state(conn)
+        threading.Thread(
+            target=connection_handler,
+            args=(conn, (host, port), True),
+            daemon=True,
+        ).start()
+        broadcast_server_list(exclude_conn=conn)
+        broadcast_client_list(exclude_conn=conn)
+        print(f"[NETWORK] Connected to server {host}:{port}.", flush=True)
+        return True
+    except OSError as error:
+        conn.close()
+        with state_lock:
+            if servers_dict.get(port) is conn:
+                del servers_dict[port]
+        print(f"[NETWORK] Could not connect to {host}:{port}: {error}")
+        return False
 
 
 def main():
@@ -486,9 +522,9 @@ def main():
         return
     own_port = SERVER_PORTS[index]
 
-    search_choice = input("Search for servers? (y/n): ").strip().lower()
-    if search_choice not in ("y", "n"):
-        print("[ERROR] Enter 'y' to search or 'n' to wait only.")
+    connection_mode = input("Server connection mode: listen (l) or connect (c)? ").strip().lower()
+    if connection_mode not in ("l", "c"):
+        print("[ERROR] Enter 'l' to listen or 'c' to connect.")
         return
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -503,12 +539,19 @@ def main():
 
     with state_lock:
         known_servers[own_port] = HOST
+        known_clients[own_port] = set()
     print(f"[LISTENING] Server active at {HOST}:{own_port}.", flush=True)
     threading.Thread(target=accept_connections, args=(server_socket,), daemon=True).start()
-    if search_choice == "y":
-        search_bootstrap_servers()
+    if connection_mode == "c":
+        host = input("Enter the server address to connect to: ").strip()
+        try:
+            port = int(input("Enter the server port to connect to: "))
+        except ValueError:
+            port = 0
+        if not host or not connect_to_server(host, port):
+            print("[NETWORK] Waiting for incoming connections.", flush=True)
     else:
-        print("[NETWORK] Search skipped; waiting for incoming connections.", flush=True)
+        print("[NETWORK] Waiting for incoming connections.", flush=True)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
